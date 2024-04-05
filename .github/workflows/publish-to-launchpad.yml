@@ -13,5 +13,6 @@ jobs:
           repository: "aaronhoneycutt/Ubuntu-COSMIC"
           gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
           gpg_passphrase: ${{ secrets.GPG_PASSPHRASE }}
+          series: "noble"
           deb_email: "aaron@system76.com"
           deb_fullname: "Aaron Honeycutt"
