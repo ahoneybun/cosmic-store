@@ -1,7 +1,16 @@
 name: Publish PPA
-uses: yuezk/publish-ppa-package@v2
-with:
-    repository: "aaronhoneycutt/Ubuntu-COSMIC"
-    gpg_private_key: ${{ secrets.PPA_GPG_PRIVATE_KEY }}
-    deb_email: "aaron@system76.com"
-    deb_fullname: "Aaron Honeycutt"
+on:
+  push:
+    branches:
+      - "master"
+
+jobs:
+  launchpad-publish:
+    runs-on: "ubuntu-latest"
+    steps:
+      uses: yuezk/publish-ppa-package@v2
+      with:
+        repository: "aaronhoneycutt/Ubuntu-COSMIC"
+        gpg_private_key: ${{ secrets.PPA_GPG_PRIVATE_KEY }}
+        deb_email: "aaron@system76.com"
+        deb_fullname: "Aaron Honeycutt"
