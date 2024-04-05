@@ -8,7 +8,7 @@ jobs:
   launchpad-publish:
     runs-on: "ubuntu-latest"
     steps:
-      - uses: ahoneybun/publish-ppa-package
+      - uses: ahoneybun/publish-ppa-package@v1
         with:
           repository: "aaronhoneycutt/Ubuntu-COSMIC"
           gpg_private_key: ${{ secrets.PPA_GPG_PRIVATE_KEY }}
