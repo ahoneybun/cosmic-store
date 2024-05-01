@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.71"
 
 [dependencies]
+chrono = "0.4"
 env_logger = "0.10"
 freedesktop_entry_parser = "1"
 lazy_static = "1"
@@ -29,7 +30,7 @@ sys-locale = "0.3"
 serde_yaml = "0.9"
 # fast cache
 atomicwrites = "0.4"
-bitcode = { version = "0.5", features = ["serde"] }
+bitcode = { version = "0.6", features = ["serde"] }
 dirs = "5"
 # flatpak feature
 libflatpak = { version = "0.4", optional = true }

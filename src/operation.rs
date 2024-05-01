@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::AppInfo;
+use crate::{AppId, AppInfo};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum OperationKind {
@@ -13,7 +13,7 @@ pub enum OperationKind {
 pub struct Operation {
     pub kind: OperationKind,
     pub backend_name: &'static str,
-    pub package_id: String,
+    pub package_id: AppId,
     pub info: Arc<AppInfo>,
 }
 
@@ -26,10 +26,16 @@ impl Operation {
             OperationKind::Update => "update",
         };
         (
-            format!("Failed to {verb} {}", self.info.name),
             format!(
-                "Failed to {verb} {} ({}):\n{err}",
-                self.info.name, self.package_id
+                "Failed to {verb} {} from {}",
+                self.info.name, self.info.source_name
+            ),
+            format!(
+                "Failed to {verb} {} ({}) from {} ({}):\n{err}",
+                self.info.name,
+                self.package_id.raw(),
+                self.info.source_name,
+                self.info.source_id
             ),
         )
     }

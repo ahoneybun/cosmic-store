@@ -1,8 +1,14 @@
 use cosmic::widget;
 use rayon::prelude::*;
-use std::{collections::HashMap, error::Error, fmt, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeMap, HashMap},
+    error::Error,
+    fmt,
+    sync::Arc,
+    time::Instant,
+};
 
-use crate::{AppInfo, AppstreamCache, OperationKind};
+use crate::{AppId, AppInfo, AppstreamCache, OperationKind};
 
 #[cfg(feature = "flatpak")]
 mod flatpak;
@@ -12,7 +18,7 @@ mod packagekit;
 
 #[derive(Clone, Debug)]
 pub struct Package {
-    pub id: String,
+    pub id: AppId,
     pub icon: widget::icon::Handle,
     pub info: Arc<AppInfo>,
     pub version: String,
@@ -20,22 +26,23 @@ pub struct Package {
 }
 
 pub trait Backend: fmt::Debug + Send + Sync {
-    fn load_cache(&mut self) -> Result<(), Box<dyn Error>>;
-    fn info_cache(&self) -> &AppstreamCache;
+    fn load_caches(&mut self, refresh: bool) -> Result<(), Box<dyn Error>>;
+    fn info_caches(&self) -> &[AppstreamCache];
     fn installed(&self) -> Result<Vec<Package>, Box<dyn Error>>;
     fn updates(&self) -> Result<Vec<Package>, Box<dyn Error>>;
     fn operation(
         &self,
         kind: OperationKind,
-        package_id: &str,
+        package_id: &AppId,
         info: &AppInfo,
         f: Box<dyn FnMut(f32) + 'static>,
     ) -> Result<(), Box<dyn Error>>;
 }
 
-pub type Backends = HashMap<&'static str, Arc<dyn Backend>>;
+// BTreeMap for stable sort order
+pub type Backends = BTreeMap<&'static str, Arc<dyn Backend>>;
 
-pub fn backends(locale: &str) -> Backends {
+pub fn backends(locale: &str, refresh: bool) -> Backends {
     let mut backends = Backends::new();
 
     #[cfg(feature = "flatpak")]
@@ -70,13 +77,13 @@ pub fn backends(locale: &str) -> Backends {
 
     backends.par_iter_mut().for_each(|(backend_name, backend)| {
         let start = Instant::now();
-        match Arc::get_mut(backend).unwrap().load_cache() {
+        match Arc::get_mut(backend).unwrap().load_caches(refresh) {
             Ok(()) => {
                 let duration = start.elapsed();
-                log::info!("loaded {} backend cache in {:?}", backend_name, duration);
+                log::info!("loaded {} backend caches in {:?}", backend_name, duration);
             }
             Err(err) => {
-                log::error!("failed to load {} backend cache: {}", backend_name, err);
+                log::error!("failed to load {} backend caches: {}", backend_name, err);
             }
         }
     });

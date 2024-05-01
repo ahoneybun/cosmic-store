@@ -6,8 +6,9 @@ use packagekit_zbus::{
 use std::{collections::HashMap, error::Error, fmt::Write, sync::Arc};
 
 use super::{Backend, Package};
-use crate::{AppInfo, AppstreamCache, OperationKind, SYSTEM_ID};
+use crate::{AppId, AppInfo, AppstreamCache, OperationKind};
 
+#[allow(dead_code)]
 struct TransactionPackage {
     info: u32,
     package_id: String,
@@ -74,6 +75,7 @@ enum FilterKind {
     Arch = 1 << 18,
 }
 
+#[allow(dead_code)]
 #[repr(u64)]
 enum TransactionFlag {
     None = 1 << 0,
@@ -85,16 +87,23 @@ enum TransactionFlag {
 #[derive(Debug)]
 pub struct Packagekit {
     connection: Connection,
-    appstream_cache: AppstreamCache,
+    appstream_caches: Vec<AppstreamCache>,
 }
 
 impl Packagekit {
     pub fn new(locale: &str) -> Result<Self, Box<dyn Error>> {
         //TODO: cache more zbus stuff?
         let connection = Connection::system()?;
+        let source_id = "packagekit";
+        //TODO: translate?
+        let source_name = "System";
         Ok(Self {
             connection,
-            appstream_cache: AppstreamCache::system(locale),
+            appstream_caches: vec![AppstreamCache::system(
+                source_id.to_string(),
+                source_name.to_string(),
+                locale,
+            )],
         })
     }
 
@@ -114,6 +123,8 @@ impl Packagekit {
         &self,
         tx: TransactionProxyBlocking,
     ) -> Result<Vec<Package>, Box<dyn Error>> {
+        let appstream_cache = &self.appstream_caches[0];
+
         let tx_packages = transaction_handle(tx, |_| {})?;
 
         let mut system_packages = Vec::new();
@@ -131,21 +142,21 @@ impl Packagekit {
             let _status_opt = data_parts.next();
             let _origin_opt = data_parts.next();
 
-            match self.appstream_cache.pkgnames.get(package_name) {
+            match appstream_cache.pkgnames.get(package_name) {
                 Some(ids) => {
                     for id in ids.iter() {
-                        match self.appstream_cache.infos.get(id) {
+                        match appstream_cache.infos.get(&id) {
                             Some(info) => {
                                 packages.push(Package {
                                     id: id.clone(),
-                                    icon: self.appstream_cache.icon(info),
+                                    icon: appstream_cache.icon(info),
                                     info: info.clone(),
                                     version: version_opt.unwrap_or("").to_string(),
                                     extra: HashMap::new(),
                                 });
                             }
                             None => {
-                                log::warn!("failed to find info {}", id);
+                                log::warn!("failed to find info {:?}", id);
                             }
                         }
                     }
@@ -175,22 +186,27 @@ impl Packagekit {
             }
             //TODO: translate
             packages.push(Package {
-                id: SYSTEM_ID.to_string(),
+                id: AppId::system(),
                 icon: widget::icon::from_name("package-x-generic")
                     .size(128)
                     .handle(),
                 //TODO: fill in more AppInfo fields
                 info: Arc::new(AppInfo {
+                    source_id: appstream_cache.source_id.clone(),
+                    source_name: appstream_cache.source_name.clone(),
                     origin_opt: None,
                     name,
                     summary,
+                    developer_name: String::new(),
                     description,
                     pkgnames,
                     categories: Vec::new(),
                     desktop_ids: Vec::new(),
                     flatpak_refs: Vec::new(),
                     icons: Vec::new(),
+                    releases: Vec::new(),
                     screenshots: Vec::new(),
+                    monthly_downloads: 0,
                 }),
                 version: String::new(),
                 extra: HashMap::new(),
@@ -201,13 +217,23 @@ impl Packagekit {
 }
 
 impl Backend for Packagekit {
-    fn load_cache(&mut self) -> Result<(), Box<dyn Error>> {
-        self.appstream_cache.reload("packagekit");
+    fn load_caches(&mut self, refresh: bool) -> Result<(), Box<dyn Error>> {
+        if refresh {
+            let tx = self.transaction()?;
+            tx.set_hints(&["interactive=true"])?;
+            //TODO: force refresh?
+            let force = false;
+            tx.refresh_cache(force)?;
+        }
+
+        for appstream_cache in self.appstream_caches.iter_mut() {
+            appstream_cache.reload();
+        }
         Ok(())
     }
 
-    fn info_cache(&self) -> &AppstreamCache {
-        &self.appstream_cache
+    fn info_caches(&self) -> &[AppstreamCache] {
+        &self.appstream_caches
     }
 
     fn installed(&self) -> Result<Vec<Package>, Box<dyn Error>> {
@@ -225,7 +251,7 @@ impl Backend for Packagekit {
     fn operation(
         &self,
         kind: OperationKind,
-        package_id: &str,
+        package_id: &AppId,
         info: &AppInfo,
         mut f: Box<dyn FnMut(f32) + 'static>,
     ) -> Result<(), Box<dyn Error>> {
@@ -234,7 +260,7 @@ impl Backend for Packagekit {
             package_names.push(pkgname.as_str());
         }
         if package_names.is_empty() {
-            return Err(format!("{} missing package name", package_id).into());
+            return Err(format!("{:?} missing package name", package_id).into());
         }
         let tx_packages = {
             let tx = self.transaction()?;

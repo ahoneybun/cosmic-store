@@ -99,6 +99,17 @@ fn convert_markup(markup: &str) -> Result<String, Box<dyn Error>> {
 pub enum AppIcon {
     Cached(String, Option<u32>, Option<u32>, Option<u32>),
     Stock(String),
+    Remote(String, Option<u32>, Option<u32>, Option<u32>),
+    Local(String, Option<u32>, Option<u32>, Option<u32>),
+}
+
+// Replaced Release due to skip_field not supported in bitcode
+#[derive(Clone, Debug, Hash, Eq, PartialEq, bitcode::Decode, bitcode::Encode)]
+pub struct AppRelease {
+    pub timestamp: Option<i64>,
+    pub version: String,
+    pub description: Option<String>,
+    pub url: Option<String>,
 }
 
 // Replaced Screenshot due to skip_field not supported in bitcode
@@ -110,23 +121,39 @@ pub struct AppScreenshot {
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, bitcode::Decode, bitcode::Encode)]
 pub struct AppInfo {
+    pub source_id: String,
+    pub source_name: String,
     pub origin_opt: Option<String>,
     pub name: String,
     pub summary: String,
+    pub developer_name: String,
     pub description: String,
     pub pkgnames: Vec<String>,
     pub categories: Vec<String>,
     pub desktop_ids: Vec<String>,
     pub flatpak_refs: Vec<String>,
     pub icons: Vec<AppIcon>,
+    pub releases: Vec<AppRelease>,
     pub screenshots: Vec<AppScreenshot>,
+    pub monthly_downloads: u64,
 }
 
 impl AppInfo {
-    pub fn new(origin_opt: Option<&str>, component: Component, locale: &str) -> Self {
+    pub fn new(
+        source_id: &str,
+        source_name: &str,
+        origin_opt: Option<&str>,
+        component: Component,
+        locale: &str,
+        monthly_downloads: u64,
+    ) -> Self {
         let name = get_translatable(&component.name, locale);
         let summary = component
             .summary
+            .as_ref()
+            .map_or("", |x| get_translatable(x, locale));
+        let developer_name = component
+            .developer_name
             .as_ref()
             .map_or("", |x| get_translatable(x, locale));
         let description_markup = component
@@ -182,7 +209,51 @@ impl AppInfo {
                     scale,
                 )),
                 Icon::Stock(path) => Some(AppIcon::Stock(path)),
-                _ => None,
+                Icon::Remote {
+                    url,
+                    width,
+                    height,
+                    scale,
+                } => Some(AppIcon::Remote(url.into(), width, height, scale)),
+                Icon::Local {
+                    path,
+                    width,
+                    height,
+                    scale,
+                } => Some(AppIcon::Local(
+                    path.to_str()?.to_string(),
+                    width,
+                    height,
+                    scale,
+                )),
+            })
+            .collect();
+        let releases = component
+            .releases
+            .into_iter()
+            .filter_map(|release| {
+                let description = release.description.as_ref().and_then(|x| {
+                    match convert_markup(get_markup_translatable(x, locale)) {
+                        Ok(ok) => Some(ok),
+                        Err(err) => {
+                            //TODO: better handling of release description
+                            log::info!(
+                                "failed to parse description of release {:?} of {:?} from {:?}: {}",
+                                release.version,
+                                component.id,
+                                origin_opt,
+                                err
+                            );
+                            None
+                        }
+                    }
+                });
+                Some(AppRelease {
+                    timestamp: release.date.map(|date| date.timestamp()),
+                    version: release.version,
+                    description,
+                    url: release.url.map(|url| url.into()),
+                })
             })
             .collect();
         let mut screenshots = Vec::new();
@@ -196,7 +267,7 @@ impl AppInfo {
                             .as_ref()
                             .map_or("", |x| get_translatable(x, locale))
                             .to_string(),
-                        url: image.url.to_string(),
+                        url: image.url.into(),
                     });
                     break;
                 }
@@ -204,16 +275,21 @@ impl AppInfo {
         }
 
         Self {
+            source_id: source_id.to_string(),
+            source_name: source_name.to_string(),
             origin_opt: origin_opt.map(|x| x.to_string()),
             name: name.to_string(),
             summary: summary.to_string(),
+            developer_name: developer_name.to_string(),
             description,
             pkgnames: component.pkgname.map_or(Vec::new(), |x| vec![x]),
             categories,
             desktop_ids,
             flatpak_refs,
             icons,
+            releases,
             screenshots,
+            monthly_downloads,
         }
     }
 }

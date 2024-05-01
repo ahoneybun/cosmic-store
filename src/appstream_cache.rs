@@ -1,7 +1,7 @@
 use appstream::{
-    enums::{ComponentKind, Icon, ImageKind, Launchable},
+    enums::{ComponentKind, Icon, ImageKind, Launchable, ReleaseKind, ReleaseUrgency},
     url::Url,
-    xmltree, Component, Image, ParseError, Screenshot,
+    xmltree, Component, Image, MarkupTranslatableString, ParseError, Release, Screenshot,
 };
 use cosmic::widget;
 use flate2::read::GzDecoder;
@@ -18,7 +18,7 @@ use std::{
     time::{Instant, SystemTime},
 };
 
-use crate::{AppIcon, AppInfo};
+use crate::{stats, AppIcon, AppId, AppInfo};
 
 const PREFIXES: &'static [&'static str] = &["/usr/share", "/var/lib", "/var/cache"];
 const CATALOGS: &'static [&'static str] = &["swcatalog", "app-info"];
@@ -43,26 +43,40 @@ pub struct AppstreamCacheTag {
 
 #[derive(Debug, Default, bitcode::Decode, bitcode::Encode)]
 pub struct AppstreamCache {
+    pub source_id: String,
+    pub source_name: String,
     // Uses btreemap for stable sort order
-    #[bitcode(with_serde)] //TODO: do not use serde
-    pub path_tags: BTreeMap<PathBuf, AppstreamCacheTag>,
-    #[bitcode(with_serde)] //TODO: do not use serde
-    pub icons_paths: Vec<PathBuf>,
+    pub path_tags: BTreeMap<String, AppstreamCacheTag>,
+    pub icons_paths: Vec<String>,
     pub locale: String,
-    pub infos: HashMap<String, Arc<AppInfo>>,
-    pub pkgnames: HashMap<String, HashSet<String>>,
+    pub infos: HashMap<AppId, Arc<AppInfo>>,
+    pub pkgnames: HashMap<String, HashSet<AppId>>,
 }
 
 impl AppstreamCache {
     /// Get cache for specified appstream data sources
-    pub fn new(paths: Vec<PathBuf>, icons_paths: Vec<PathBuf>, locale: &str) -> Self {
+    pub fn new(
+        source_id: String,
+        source_name: String,
+        paths: Vec<PathBuf>,
+        icons_paths: Vec<String>,
+        locale: &str,
+    ) -> Self {
         let mut cache = Self::default();
+        cache.source_id = source_id;
+        cache.source_name = source_name;
         cache.icons_paths = icons_paths;
         cache.locale = locale.to_string();
 
         for path in paths.iter() {
             let canonical = match fs::canonicalize(path) {
-                Ok(ok) => ok,
+                Ok(pathbuf) => match pathbuf.into_os_string().into_string() {
+                    Ok(ok) => ok,
+                    Err(os_string) => {
+                        log::error!("failed to convert {:?} to string", os_string);
+                        continue;
+                    }
+                },
                 Err(err) => {
                     log::error!("failed to canonicalize {:?}: {}", path, err);
                     continue;
@@ -106,7 +120,7 @@ impl AppstreamCache {
     }
 
     /// Get cache for system appstream data sources
-    pub fn system(locale: &str) -> Self {
+    pub fn system(source_id: String, source_name: String, locale: &str) -> Self {
         let mut paths = Vec::new();
         let mut icons_paths = Vec::new();
         //TODO: get using xdg dirs?
@@ -155,12 +169,17 @@ impl AppstreamCache {
 
                 let icons_path = catalog_path.join("icons");
                 if icons_path.is_dir() {
-                    icons_paths.push(icons_path);
+                    match icons_path.into_os_string().into_string() {
+                        Ok(ok) => icons_paths.push(ok),
+                        Err(os_string) => {
+                            log::error!("failed to convert {:?} to string", os_string)
+                        }
+                    }
                 }
             }
         }
 
-        AppstreamCache::new(paths, icons_paths, locale)
+        AppstreamCache::new(source_id, source_name, paths, icons_paths, locale)
     }
 
     /// Directory where cache should be stored
@@ -170,7 +189,7 @@ impl AppstreamCache {
 
     /// Versioned filename of cache
     fn cache_filename() -> &'static str {
-        "appstream_cache-v0-1.bitcode-v0-5"
+        "appstream_cache-v0-1.bitcode-v0-6"
     }
 
     /// Remove all files from cache not matching filename
@@ -298,13 +317,7 @@ impl AppstreamCache {
     pub fn save_cache(&self, cache_name: &str) {
         let start = Instant::now();
 
-        let bitcode = match bitcode::encode::<Self>(self) {
-            Ok(ok) => ok,
-            Err(err) => {
-                log::warn!("failed to encode cache {:?}: {}", cache_name, err);
-                return;
-            }
-        };
+        let bitcode = bitcode::encode::<Self>(self);
 
         let cache_dir = match self.cache_dir(cache_name) {
             Some(some) => some,
@@ -341,7 +354,7 @@ impl AppstreamCache {
             .path_tags
             .par_iter()
             .filter_map(|(path, _tag)| {
-                let file_name = match path.file_name() {
+                let file_name = match Path::new(path).file_name() {
                     Some(file_name_os) => match file_name_os.to_str() {
                         Some(some) => some,
                         None => {
@@ -366,7 +379,7 @@ impl AppstreamCache {
 
                 if file_name.ends_with(".xml.gz") {
                     let mut gz = GzDecoder::new(&mut file);
-                    match AppstreamCache::parse_xml(path, &mut gz, &self.locale) {
+                    match self.parse_xml(path, &mut gz) {
                         Ok(infos) => Some(infos),
                         Err(err) => {
                             log::error!("failed to parse {:?}: {}", path, err);
@@ -375,7 +388,7 @@ impl AppstreamCache {
                     }
                 } else if file_name.ends_with(".yml.gz") {
                     let mut gz = GzDecoder::new(&mut file);
-                    match AppstreamCache::parse_yaml(path, &mut gz, &self.locale) {
+                    match self.parse_yaml(path, &mut gz) {
                         Ok(infos) => Some(infos),
                         Err(err) => {
                             log::error!("failed to parse {:?}: {}", path, err);
@@ -383,7 +396,7 @@ impl AppstreamCache {
                         }
                     }
                 } else if file_name.ends_with(".xml") {
-                    match AppstreamCache::parse_xml(path, &mut file, &self.locale) {
+                    match self.parse_xml(path, &mut file) {
                         Ok(infos) => Some(infos),
                         Err(err) => {
                             log::error!("failed to parse {:?}: {}", path, err);
@@ -391,7 +404,7 @@ impl AppstreamCache {
                         }
                     }
                 } else if file_name.ends_with(".yml") {
-                    match AppstreamCache::parse_yaml(path, &mut file, &self.locale) {
+                    match self.parse_yaml(path, &mut file) {
                         Ok(infos) => Some(infos),
                         Err(err) => {
                             log::error!("failed to parse {:?}: {}", path, err);
@@ -416,7 +429,7 @@ impl AppstreamCache {
                 match self.infos.insert(id.clone(), info) {
                     Some(_old) => {
                         //TODO: merge based on priority
-                        log::debug!("found duplicate info {}", id);
+                        log::debug!("found duplicate info {:?}", id);
                     }
                     None => {}
                 }
@@ -425,11 +438,12 @@ impl AppstreamCache {
     }
 
     /// Either load from cache or load from originals. Cache is cleaned before loading and saved after.
-    pub fn reload(&mut self, cache_name: &str) {
-        self.clean_cache(cache_name);
-        if !self.load_cache(cache_name) {
+    pub fn reload(&mut self) {
+        let source_id = self.source_id.clone();
+        self.clean_cache(&source_id);
+        if !self.load_cache(&source_id) {
             self.load_original();
-            self.save_cache(cache_name);
+            self.save_cache(&source_id);
         }
     }
 
@@ -453,7 +467,19 @@ impl AppstreamCache {
         };
 
         for icons_path in self.icons_paths.iter() {
-            let icon_path = icons_path.join(origin).join(&size).join(name);
+            let icon_path = Path::new(icons_path).join(origin).join(&size).join(name);
+            if icon_path.is_file() {
+                return Some(icon_path);
+            }
+        }
+
+        //TODO: smarter removal of .desktop
+        let fallback_name = name.replace(".desktop", "");
+        for icons_path in self.icons_paths.iter() {
+            let icon_path = Path::new(icons_path)
+                .join(origin)
+                .join(&size)
+                .join(&fallback_name);
             if icon_path.is_file() {
                 return Some(icon_path);
             }
@@ -486,23 +512,43 @@ impl AppstreamCache {
                         // Skip if a cached icon was found
                         continue;
                     }
-                    icon_opt = Some(widget::icon::from_name(stock.clone()).size(128).handle());
+                    if let Some(icon_path) = widget::icon::from_name(stock.clone()).size(128).path()
+                    {
+                        icon_opt = Some(widget::icon::from_path(icon_path));
+                    }
+                }
+                AppIcon::Remote(_url, _width, _height, _scale) => {
+                    //TODO
+                }
+                AppIcon::Local(path, width, height, _scale) => {
+                    let size = cmp::min(width.unwrap_or(0), height.unwrap_or(0));
+                    if size < cached_size {
+                        // Skip if size is less than cached size
+                        continue;
+                    }
+                    let icon_path = Path::new(path);
+                    if icon_path.is_file() {
+                        icon_opt = Some(widget::icon::from_path(icon_path.to_path_buf()));
+                        cached_size = size;
+                    }
                 }
             }
         }
         icon_opt.unwrap_or_else(|| {
+            log::debug!("failed to get icon from {:?}", info.icons);
             widget::icon::from_name("package-x-generic")
                 .size(128)
                 .handle()
         })
     }
 
-    fn parse_xml<R: Read>(
-        path: &Path,
+    fn parse_xml<P: AsRef<Path>, R: Read>(
+        &self,
+        path: P,
         reader: R,
-        locale: &str,
-    ) -> Result<Vec<(String, Arc<AppInfo>)>, Box<dyn Error>> {
+    ) -> Result<Vec<(AppId, Arc<AppInfo>)>, Box<dyn Error>> {
         let start = Instant::now();
+        let path = path.as_ref();
         //TODO: just running this and not saving the results makes a huge memory leak!
         let e = xmltree::Element::parse(reader)?;
         let _version = e
@@ -525,13 +571,17 @@ impl AppstreamCache {
                                     return None;
                                 }
 
-                                let id = component.id.to_string();
+                                let id = AppId::new(&component.id.0);
+                                let monthly_downloads = stats::monthly_downloads(&id).unwrap_or(0);
                                 return Some((
                                     id,
                                     Arc::new(AppInfo::new(
+                                        &self.source_id,
+                                        &self.source_name,
                                         origin_opt.map(|x| x.as_str()),
                                         component,
-                                        locale,
+                                        &self.locale,
+                                        monthly_downloads,
                                     )),
                                 ));
                             }
@@ -560,12 +610,13 @@ impl AppstreamCache {
         Ok(infos)
     }
 
-    fn parse_yaml<R: Read>(
-        path: &Path,
+    fn parse_yaml<P: AsRef<Path>, R: Read>(
+        &self,
+        path: P,
         reader: R,
-        locale: &str,
-    ) -> Result<Vec<(String, Arc<AppInfo>)>, Box<dyn Error>> {
+    ) -> Result<Vec<(AppId, Arc<AppInfo>)>, Box<dyn Error>> {
         let start = Instant::now();
+        let path = path.as_ref();
         let mut origin_opt = None;
         let mut media_base_url_opt = None;
         let mut infos = Vec::new();
@@ -714,10 +765,71 @@ impl AppstreamCache {
                             }
                         }
 
-                        if let Some(screenshots) = value["Screenshots"].as_sequence() {
-                            if &component.id.0 == "com.system76.CosmicEdit" {
-                                println!("{:?}", screenshots);
+                        if let Some(releases) = value["Releases"].as_sequence() {
+                            for release_value in releases {
+                                if let Some(release) = release_value.as_mapping() {
+                                    //TODO: read more fields
+                                    let component_release = Release {
+                                        date: release
+                                            .get("unix-timestamp")
+                                            .and_then(|x| x.as_i64())
+                                            .and_then(|timestamp| {
+                                                chrono::DateTime::<chrono::Utc>::from_timestamp(
+                                                    timestamp, 0,
+                                                )
+                                            }),
+                                        date_eol: None,
+                                        version: release
+                                            .get("version")
+                                            .and_then(|x| x.as_str())
+                                            .unwrap_or_default()
+                                            .to_string(),
+                                        description: release
+                                            .get("description")
+                                            .and_then(|x| x.as_mapping())
+                                            .map(|x| {
+                                                //TODO: more efficient way to convert this
+                                                let mut items = BTreeMap::new();
+                                                for (key, value) in
+                                                    x.into_iter().filter_map(|(key, value)| {
+                                                        Some((key.as_str()?, value.as_str()?))
+                                                    })
+                                                {
+                                                    items
+                                                        .insert(key.to_string(), value.to_string());
+                                                }
+                                                MarkupTranslatableString(items)
+                                            }),
+                                        kind: release
+                                            .get("type")
+                                            .and_then(|x| x.as_str())
+                                            .and_then(|x| match x {
+                                                "stable" => Some(ReleaseKind::Stable),
+                                                "development" => Some(ReleaseKind::Development),
+                                                _ => None,
+                                            })
+                                            .unwrap_or_default(),
+                                        sizes: Vec::new(),
+                                        urgency: release
+                                            .get("urgency")
+                                            .and_then(|x| x.as_str())
+                                            .and_then(|x| match x {
+                                                "low" => Some(ReleaseUrgency::Low),
+                                                "medium" => Some(ReleaseUrgency::Medium),
+                                                "high" => Some(ReleaseUrgency::High),
+                                                "critical" => Some(ReleaseUrgency::Critical),
+                                                _ => None,
+                                            })
+                                            .unwrap_or_default(),
+                                        artifacts: Vec::new(),
+                                        url: None,
+                                    };
+                                    component.releases.push(component_release)
+                                }
                             }
+                        }
+
+                        if let Some(screenshots) = value["Screenshots"].as_sequence() {
                             for screenshot_value in screenshots {
                                 if let Some(screenshot) = screenshot_value.as_mapping() {
                                     let mut images = Vec::new();
@@ -767,10 +879,18 @@ impl AppstreamCache {
                             }
                         }
 
-                        let id = component.id.to_string();
+                        let id = AppId::new(&component.id.0);
+                        let monthly_downloads = stats::monthly_downloads(&id).unwrap_or(0);
                         infos.push((
                             id,
-                            Arc::new(AppInfo::new(origin_opt.as_deref(), component, locale)),
+                            Arc::new(AppInfo::new(
+                                &self.source_id,
+                                &self.source_name,
+                                origin_opt.as_deref(),
+                                component,
+                                &self.locale,
+                                monthly_downloads,
+                            )),
                         ));
                     }
                     Err(err) => {

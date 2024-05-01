@@ -1,5 +1,9 @@
 use std::{collections::HashMap, error::Error, fs};
 
+use app_id::AppId;
+#[path = "../../src/app_id.rs"]
+mod app_id;
+
 #[derive(serde::Deserialize)]
 pub struct Stats {
     refs: HashMap<String, HashMap<String, (u64, u64)>>,
@@ -16,28 +20,22 @@ async fn stats(year: u16, month: u8, day: u8) -> Result<Stats, Box<dyn Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let year = 2024;
-    let month = 2;
-    let days = 29;
+    let month = 3;
+    let days = 31;
 
-    let mut ref_downloads = HashMap::new();
+    let mut ref_downloads = HashMap::<AppId, u64>::new();
     for day in 1..=days {
         let stats = stats(year, month, day).await?;
         for (id, archs) in stats.refs {
             for (_arch, (downloads, _updates)) in archs {
-                *ref_downloads.entry(id.clone()).or_insert(0) += downloads;
+                *ref_downloads.entry(AppId::new(&id)).or_insert(0) += downloads;
             }
         }
     }
 
-    let mut sorted = Vec::<(String, u64)>::new();
-    for (id, downloads) in ref_downloads {
-        sorted.push((id, downloads));
-    }
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
-
-    let bitcode = bitcode::encode(&sorted)?;
+    let bitcode = bitcode::encode(&ref_downloads);
     fs::write(
-        format!("flathub-stats-{year}-{month:02}.bitcode-v0-5"),
+        format!("flathub-stats-{year}-{month:02}.bitcode-v0-6"),
         &bitcode,
     )?;
 

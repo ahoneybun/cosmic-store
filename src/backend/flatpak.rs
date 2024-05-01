@@ -7,80 +7,134 @@ use std::{
 };
 
 use super::{Backend, Package};
-use crate::{AppInfo, AppstreamCache, OperationKind};
+use crate::{AppId, AppInfo, AppstreamCache, OperationKind};
 
 #[derive(Debug)]
 pub struct Flatpak {
-    appstream_cache: AppstreamCache,
+    appstream_caches: Vec<AppstreamCache>,
 }
 
 impl Flatpak {
     pub fn new(locale: &str) -> Result<Self, Box<dyn Error>> {
+        let mut appstream_caches = Vec::new();
+
         //TODO: should we support system installations?
         let inst = Installation::new_user(Cancellable::NONE)?;
-        let mut paths = Vec::new();
-        let mut icons_paths = Vec::new();
         for remote in inst.list_remotes(Cancellable::NONE)? {
-            if let Some(appstream_dir) = remote.appstream_dir(None).and_then(|x| x.path()) {
-                let xml_gz_path = appstream_dir.join("appstream.xml.gz");
-                if xml_gz_path.is_file() {
-                    paths.push(xml_gz_path);
-                } else {
-                    let xml_path = appstream_dir.join("appstream.xml");
-                    if xml_path.is_file() {
-                        paths.push(xml_path);
-                    }
+            let source_id = match remote.name() {
+                Some(some) => some.to_string(),
+                None => {
+                    log::warn!("remote {:?} missing name", remote);
+                    continue;
                 }
+            };
 
-                let icons_path = appstream_dir.join("icons");
-                if icons_path.is_dir() {
-                    icons_paths.push(icons_path);
+            let appstream_dir = match remote.appstream_dir(None).and_then(|x| x.path()) {
+                Some(some) => some,
+                None => {
+                    log::warn!("remote {:?} missing appstream dir", remote);
+                    continue;
+                }
+            };
+
+            let mut paths = Vec::new();
+            let xml_gz_path = appstream_dir.join("appstream.xml.gz");
+            if xml_gz_path.is_file() {
+                paths.push(xml_gz_path);
+            } else {
+                let xml_path = appstream_dir.join("appstream.xml");
+                if xml_path.is_file() {
+                    paths.push(xml_path);
                 }
             }
+
+            let mut icons_paths = Vec::new();
+            let icons_path = appstream_dir.join("icons");
+            if icons_path.is_dir() {
+                match icons_path.into_os_string().into_string() {
+                    Ok(ok) => icons_paths.push(ok),
+                    Err(os_string) => {
+                        log::error!("failed to convert {:?} to string", os_string)
+                    }
+                }
+            }
+
+            let source_name = match remote.title() {
+                Some(title) => title.to_string(),
+                None => source_id.clone(),
+            };
+            appstream_caches.push(AppstreamCache::new(
+                source_id,
+                source_name,
+                paths,
+                icons_paths,
+                locale,
+            ));
         }
 
         // We don't store the installation because it is not Send
-        Ok(Self {
-            appstream_cache: AppstreamCache::new(paths, icons_paths, locale),
-        })
+        Ok(Self { appstream_caches })
     }
 
     fn ref_to_package<R: InstalledRefExt + RefExt>(&self, r: R) -> Option<Package> {
-        let id = r.name()?;
-        match self.appstream_cache.infos.get(id.as_str()) {
-            Some(info) => {
-                let mut extra = HashMap::new();
-                if let Some(arch) = r.arch() {
-                    extra.insert("arch".to_string(), arch.to_string());
-                }
-                if let Some(branch) = r.branch() {
-                    extra.insert("branch".to_string(), branch.to_string());
-                }
+        let id_raw = r.name()?;
+        let id = AppId::new(&id_raw);
+        let origin = r.origin()?;
+        for appstream_cache in self.appstream_caches.iter() {
+            if &appstream_cache.source_id != &origin {
+                // Only show items from correct cache
+                continue;
+            }
 
-                Some(Package {
-                    id: id.to_string(),
-                    icon: self.appstream_cache.icon(info),
-                    info: info.clone(),
-                    version: r.appdata_version().unwrap_or_default().to_string(),
-                    extra,
-                })
+            //TODO: better matching of .desktop suffix
+            let info = match appstream_cache.infos.get(&id) {
+                Some(some) => some,
+                None => continue,
+            };
+
+            let mut extra = HashMap::new();
+            if let Some(arch) = r.arch() {
+                extra.insert("arch".to_string(), arch.to_string());
             }
-            None => {
-                log::warn!("failed to find info {}", id);
-                None
+            if let Some(branch) = r.branch() {
+                extra.insert("branch".to_string(), branch.to_string());
             }
+
+            return Some(Package {
+                id: id.clone(),
+                icon: appstream_cache.icon(info),
+                info: info.clone(),
+                version: r.appdata_version().unwrap_or_default().to_string(),
+                extra,
+            });
         }
+
+        log::warn!("failed to find info for {:?} from {}", id, origin);
+        None
     }
 }
 
 impl Backend for Flatpak {
-    fn load_cache(&mut self) -> Result<(), Box<dyn Error>> {
-        self.appstream_cache.reload("flatpak");
+    fn load_caches(&mut self, refresh: bool) -> Result<(), Box<dyn Error>> {
+        if refresh {
+            //TODO: should we support system installations?
+            let inst = Installation::new_user(Cancellable::NONE)?;
+            for remote in inst.list_remotes(Cancellable::NONE)? {
+                let Some(remote_name) = remote.name() else {
+                    continue;
+                };
+                inst.update_remote_sync(&remote_name, Cancellable::NONE)?;
+            }
+        }
+
+        for appstream_cache in self.appstream_caches.iter_mut() {
+            appstream_cache.reload();
+        }
         Ok(())
     }
 
-    fn info_cache(&self) -> &AppstreamCache {
-        &self.appstream_cache
+    fn info_caches(&self) -> &[AppstreamCache] {
+        &self.appstream_caches
     }
 
     fn installed(&self) -> Result<Vec<Package>, Box<dyn Error>> {
@@ -114,7 +168,7 @@ impl Backend for Flatpak {
     fn operation(
         &self,
         kind: OperationKind,
-        id: &str,
+        id: &AppId,
         info: &AppInfo,
         callback: Box<dyn FnMut(f32) + 'static>,
     ) -> Result<(), Box<dyn Error>> {
@@ -168,6 +222,9 @@ impl Backend for Flatpak {
                         let Some(remote_name) = remote.name() else {
                             continue;
                         };
+                        if remote_name != info.source_id {
+                            continue;
+                        }
                         match inst.fetch_remote_ref_sync(
                             &remote_name,
                             r.kind(),
@@ -178,7 +235,7 @@ impl Backend for Flatpak {
                         ) {
                             Ok(_) => {}
                             Err(err) => {
-                                log::info!("failed to find {} in {}: {}", id, remote_name, err);
+                                log::info!("failed to find {:?} in {}: {}", id, remote_name, err);
                                 continue;
                             }
                         };
@@ -209,7 +266,7 @@ impl Backend for Flatpak {
                     ) {
                         Ok(_) => {}
                         Err(err) => {
-                            log::info!("failed to find {} installed locally: {}", id, err);
+                            log::info!("failed to find {:?} installed locally: {}", id, err);
                             continue;
                         }
                     };
@@ -239,7 +296,7 @@ impl Backend for Flatpak {
                     ) {
                         Ok(_) => {}
                         Err(err) => {
-                            log::info!("failed to find {} installed locally: {}", id, err);
+                            log::info!("failed to find {:?} installed locally: {}", id, err);
                             continue;
                         }
                     };
@@ -251,6 +308,6 @@ impl Backend for Flatpak {
                 }
             }
         }
-        Err(format!("package {id} not found").into())
+        Err(format!("package {id:?} not found").into())
     }
 }
